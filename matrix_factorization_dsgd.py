@@ -9,6 +9,9 @@ from numpy import savetxt
 import random
 # all comments are why? not what?
 
+#Just testing githiub
+#####################################################
+
 # number of iterations
 I = int(sys.argv[1])
 # number of workers
