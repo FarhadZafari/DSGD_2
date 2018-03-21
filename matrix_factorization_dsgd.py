@@ -7,23 +7,11 @@ import numpy as np
 from numpy.random import rand
 from numpy import savetxt
 import random
-from click import command, option
+import logging
+import logger
+import time
+
 # all comments are why? not what?
-
-
-# # number of iterations
-# I = int(sys.argv[1])
-# # number of workers
-# B = int(sys.argv[2])
-# # number of factors
-# F = int(sys.argv[3])
-# # beta value
-# beta = float(sys.argv[4])
-# # lambda input
-# lambda_input = float(sys.argv[5])
-
-# global random_num, total_update_count
-# global Nj, Ni
 
 class Distributed_Stochastic_Gradient_Decent:
     def __init__(self, num_iterations, num_workers, num_factors, learning_rate, reg):
@@ -34,6 +22,15 @@ class Distributed_Stochastic_Gradient_Decent:
         self.lambda_input = reg
         self.user_factors = {}
         self.item_factors = {}
+
+        self.users = set()
+        self.items = set()
+
+        self.users_id_to_index = {}
+        self.users_index_to_id = {}
+
+        self.items_id_to_index = {}
+        self.items_index_to_id = {}
 
     # small method to print the contents of RDD
     def print_rdd(self, RDD):
@@ -59,8 +56,20 @@ class Distributed_Stochastic_Gradient_Decent:
         lines = file.collect()
         for line in lines:
             line_array = line.split(",")
-            row_indices.append(int(line_array[0]) - 1)
-            col_indices.append(int(line_array[1]) - 1)
+            user = line_array[1]
+            self.users.add(user)
+            user_id = len(self.users) - 1
+            if user not in self.users_id_to_index.keys():
+                self.users_index_to_id[user_id] = user
+                self.users_id_to_index[user] = user_id
+            row_indices.append(user_id)
+            item = line_array[0]
+            self.items.add(item)
+            item_id = len(self.items) - 1
+            if item not in self.items_id_to_index.keys():
+                self.items_index_to_id[item_id] = item
+                self.items_id_to_index[item] = item_id
+            col_indices.append(item_id)
             data_rating.append(float(line_array[2]))
 
         return csr_matrix((data_rating, (row_indices, col_indices)))
@@ -89,9 +98,9 @@ class Distributed_Stochastic_Gradient_Decent:
         return (W_dict.items(), H_dict.items())
 
     # l2 loss
-    def L2_loss(self, V, W, H):
-        # temporaray W and H to calculate the difference
-        V_temp = W.dot(H)
+    def L2_loss(self, V, Q, P):
+        # temporaray Q and P to calculate the difference
+        V_temp = Q.dot(P)
         # number of non zero index
         nz_index = V.nonzero()
         # calcualte the difference after calulating list into array
@@ -100,29 +109,65 @@ class Distributed_Stochastic_Gradient_Decent:
         sum = np.sum(difference ** 2)
         return sum
 
-    def train(self):
-        # made the spark contest
-        sc = SparkContext(appName="Matric matrix_factorization_dsgd.py using Distributed Stochastic Gradient Descent")
+    def ReadCSV(self, sc, path):
         # input file
-        netflix_file = sc.textFile("nf_subsample.csv")
-
+        netflix_file = sc.textFile(path)
         # data in tuple form
-        ratings_data = netflix_file.map(lambda x: [int(y) for y in x.split(',')])
+        ratings_data = netflix_file.map(lambda x: [str(y) for y in x.split(',')])
+        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+        ratings_data_list = ratings_data.collect()
 
+        temp_file = open('tempfile.txt', 'w')
+        ratings_data_new_list = []
+        for l in ratings_data_list:
+            ##################################
+            user = l[0]
+            self.users.add(user)
+            user_id = len(self.users) - 1
+            if user not in self.users_id_to_index.keys():
+                self.users_id_to_index[user] = user_id
+                self.users_index_to_id[user_id] = user
+            ##################################
+            item = l[1]
+            self.items.add(item)
+            item_id = len(self.items) - 1
+            if item not in self.items_id_to_index.keys():
+                self.items_id_to_index[item] = item_id
+                self.items_index_to_id[item_id] = item
+            ##################################
+            rating = int(l[2])
+            #The program is expecting to see user ids in the first column, and the item ids in the second column.
+            #Since our data puts user ids at first column, I invert the data so that it is compatible with the program.
+            temp_file.write(str(item_id) + ',' + str(user_id) + ',' + str(rating) + '\n')
+        ratings_data_new_list_back_to_rdd = sc.textFile('tempfile.txt').map(lambda x: [int(y) for y in x.split(',')])
+        print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        return ratings_data_new_list_back_to_rdd
+
+    def train(self):
+        start = time.time()
+        # made the spark context
+        sc = SparkContext(appName="Matric matrix_factorization_dsgd.py using Distributed Stochastic Gradient Descent")
+
+        ratings_data = self.ReadCSV(sc, "ratings.csv")
         # to calculate l2 loss
         self.Nj = ratings_data.keyBy(lambda x: x[0]).countByKey()
         self.Ni = ratings_data.keyBy(lambda x: x[1]).countByKey()
 
         # here its 2000,2000
-        num_movies, num_users = ratings_data.reduce(lambda x,y: (max(x[0],y[0]),max(x[1],y[1])))
+        num_items, num_users = ratings_data.reduce(lambda x,y: (max(x[0],y[0]),max(x[1],y[1])))
+        num_items = num_items + 1
+        num_users = num_users + 1
+
+        print("num_users: ", num_users)
+        print("num_items: ", num_items)
 
         # global varibale to keep track of all previous itertaions
         self.total_update_count = 0
 
-        # initilized W and H with same number of values as of number of users and movies
+        # initilized Q and P with same number of values as of number of users and items
         # randomizing according to factors provided by the user
-        W = sc.parallelize(range(num_movies + 1)).map(lambda x: (x, rand(self.F)))
-        H = sc.parallelize(range(num_users + 1)).map(lambda x: (x, rand(self.F)))
+        Q = sc.parallelize(range(num_items + 1)).map(lambda x: (x, rand(self.F)))
+        P = sc.parallelize(range(num_users + 1)).map(lambda x: (x, rand(self.F)))
 
         # print_rdd(W)
         # to initialize number of iterations
@@ -133,9 +178,9 @@ class Distributed_Stochastic_Gradient_Decent:
             # random number to select startum
             self.random_num = random.randrange(999999)
 
-            # get blocks of parameters Wib and Hib
-            Wib = W.keyBy(lambda x: (hash(str(x[0]) + str(self.random_num)) % self.B))
-            Hib = H.keyBy(lambda x: (hash(str(x[0]) + str(self.random_num)) % self.B))
+            # get blocks of parameters Qib and Pib
+            Qib = Q.keyBy(lambda x: (hash(str(x[0]) + str(self.random_num)) % self.B))
+            Pib = P.keyBy(lambda x: (hash(str(x[0]) + str(self.random_num)) % self.B))
 
             # get diagonal blocks
             V_diag = ratings_data.filter(lambda x:
@@ -149,36 +194,69 @@ class Distributed_Stochastic_Gradient_Decent:
             curr_upd_count = V_diag.count()
 
 
-            # group Vblock, Wib and Hib to send it to SGD update
-            V_group = V_blocks.groupWith(Wib, Hib).coalesce(self.B)
+            # group Vblock, Qib and Pib to send it to SGD update
+            V_group = V_blocks.groupWith(Qib, Pib).coalesce(self.B)
 
             # for x in V_group.collect():
             #     print (x)
-            # get the updated W and H after SGD update
-            new_WH = V_group.map(self.SGD_update)
+            # get the updated Q and P after SGD update
+            new_QP = V_group.map(self.SGD_update)
 
-            # separated W and H
-            W = new_WH.flatMap(lambda x: x[0])
-            H = new_WH.flatMap(lambda x: x[1])
+            # separated Q and P
+            Q = new_QP.flatMap(lambda x: x[0])
+            P = new_QP.flatMap(lambda x: x[1])
 
-            # updated W and H which are sequence of arrays to form one single array
-            W_result_temp = np.vstack(W.sortByKey().map(lambda x: x[1]).collect()[1:])
-            H_result_temp = np.vstack(H.sortByKey().map(lambda x: x[1]).collect()[1:])
-            # transpose to multiple W and H
-            W_result = W_result_temp
-            H_result = H_result_temp.T
+            # updated Q and P which are sequence of arrays to form one single array
+            Q_Result_temp = np.vstack(Q.sortByKey().map(lambda x: x[1]).collect()[1:])
+            P_Result_temp = np.vstack(P.sortByKey().map(lambda x: x[1]).collect()[1:])
+            # transpose to multiple Q and P
+            Q_Result = Q_Result_temp
+            P_Result = P_Result_temp.T
 
             # update total updates or 'n' in algorithm 2 after each iteration
             self.total_update_count += curr_upd_count
             # print the l2 loss for alogrithm
-            # send sparse matrix, W and H to find the loss
-            # print (L2_loss(CSV_to_sparse(netflix_file), W_result_temp, H_result))
+            # send sparse matrix, Q and P to find the loss
+            # print (L2_loss(CSV_to_sparse(netflix_file), Q_Result_temp, P_Result))
             # increment the loop
             iterations += 1
 
         # L2 Loss after number of iterations
-        print (self.L2_loss(self.CSV_to_sparse(netflix_file), W_result_temp, H_result))
-        # M = sc.parallelize(W_result_temp.dot(H_result))
-        savetxt("W.txt", W_result, delimiter=',')
-        savetxt("H.txt", H_result, delimiter=',')
+        #print ("Loss is =======================>" + self.L2_loss(self.CSV_to_sparse(netflix_file), Q_Result_temp, P_Result))
+        # M = sc.parallelize(Q_Result_temp.dot(P_Result))
+        savetxt("Q.txt", Q_Result_temp, delimiter=',')
+        savetxt("P.txt", P_Result_temp, delimiter=',')
         # M.coalesce(1, True).saveAsTextFile("output")
+
+        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+        self.exportMatrices(Q_Result_temp, P_Result_temp)
+        print("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&")
+        # run your code
+        end = time.time()
+        elapsed = end - start
+        print("======================================== Elapsed time is: ", elapsed)
+
+    def exportMatrices(self, Q_Result, P_Result):
+        print("self.users_id_to_index", self.users_id_to_index)
+        print("self.users_index_to_id", self.users_index_to_id)
+        print("self.items_id_to_index", self.items_id_to_index)
+        print("self.items_index_to_id", self.items_index_to_id)
+        print('$$$$$$$$$$$$$$$$$$$$$$$$$exportMatrices$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$')
+        user_id = 0
+        print("P_Result (users):", P_Result)
+        print("Q_Result (items):", Q_Result)
+
+        for l in P_Result:
+            self.user_factors[self.users_index_to_id[user_id]] = l
+            user_id = user_id + 1
+
+        item_id = 0
+        for l in Q_Result:
+            self.item_factors[self.items_index_to_id[item_id]] = l
+            item_id = item_id + 1
+
+        print(len(self.user_factors))
+        print(len(self.item_factors))
+        print('$$$$$$$$$$$$$$$$$$$$$$$$$exportMatrices$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$')
+
+
